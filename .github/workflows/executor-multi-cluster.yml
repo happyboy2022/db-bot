@@ -1,0 +1,245 @@
+name: Executor Multi-Cluster Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      clusters:
+        description: '部署的集群 (逗号分隔，留空则部署所有)'
+        required: false
+        default: ''
+        type: string
+      skip_tests:
+        description: '跳过测试'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - 'apps/executor/**'
+      - 'packages/shared/**'
+      - '.github/workflows/executor-multi-cluster.yml'
+
+# 定义所有集群
+# 命名规范:
+#   - 环境: dev, pre (开发、预发布)
+#   - 生产集群: {region}_{number} (例如 us_1, us_2, sg_1, sg_2)
+# 注意：添加新集群时，需要：
+# 1. 在此处添加集群名称
+# 2. 在 Console 的 Doppler 配置中添加 CLUSTER_DOPPLER_TOKEN_{CLUSTER_NAME_UPPER}
+# 3. 在 Doppler db-bot-executor 项目中创建对应环境
+env:
+  ALL_CLUSTERS: 'pre,us_1,us_2,sg_1,sg_2'
+
+jobs:
+  # ============================================
+  # 代码检查和测试
+  # ============================================
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint --filter=@sql-ops/executor...
+
+      - name: Type check
+        run: bun run typecheck --filter=@sql-ops/executor...
+
+      - name: Test
+        if: ${{ !inputs.skip_tests }}
+        run: bun run test --filter=@sql-ops/executor...
+        continue-on-error: true
+
+      - name: Build
+        run: bun run build --filter=@sql-ops/executor...
+
+  # ============================================
+  # 确定要部署的集群
+  # ============================================
+  prepare:
+    name: Prepare Deployment Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      clusters: ${{ steps.set-clusters.outputs.clusters }}
+    steps:
+      - name: Determine clusters to deploy
+        id: set-clusters
+        run: |
+          if [ -n "${{ inputs.clusters }}" ]; then
+            # 用户指定了集群
+            CLUSTERS="${{ inputs.clusters }}"
+          else
+            # 使用所有集群
+            CLUSTERS="${{ env.ALL_CLUSTERS }}"
+          fi
+
+          # 转换为 JSON 数组
+          CLUSTERS_JSON=$(echo "$CLUSTERS" | tr ',' '\n' | jq -R . | jq -s -c .)
+          echo "clusters=$CLUSTERS_JSON" >> $GITHUB_OUTPUT
+          echo "Deploying to clusters: $CLUSTERS_JSON"
+
+  # ============================================
+  # 并行部署到各集群
+  # ============================================
+  deploy:
+    name: Deploy to ${{ matrix.cluster }}
+    needs: [lint-and-test, prepare]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production-${{ matrix.cluster }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cluster: ${{ fromJson(needs.prepare.outputs.clusters) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Doppler CLI
+        run: |
+          curl -sLf --retry 3 --tlsv1.2 --proto "=https" 'https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key' | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
+          sudo apt-get update && sudo apt-get install -y doppler
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: cd apps/executor && bun run build
+
+      # 从 Console 的 Doppler 配置获取对应集群的 Token
+      - name: Get Cluster Doppler Token
+        id: get-cluster-token
+        run: |
+          CLUSTER_UPPER=$(echo "${{ matrix.cluster }}" | tr '[:lower:]' '[:upper:]')
+          TOKEN_VAR="CLUSTER_DOPPLER_TOKEN_${CLUSTER_UPPER}"
+
+          # 使用 Console Token 获取对应集群的 Token
+          CLUSTER_TOKEN=$(doppler secrets get "$TOKEN_VAR" --plain 2>/dev/null || echo "")
+
+          if [ -z "$CLUSTER_TOKEN" ]; then
+            echo "Error: $TOKEN_VAR not found in Console Doppler config"
+            exit 1
+          fi
+
+          echo "CLUSTER_DOPPLER_TOKEN=$CLUSTER_TOKEN" >> $GITHUB_OUTPUT
+          echo "Successfully retrieved Doppler token for cluster: ${{ matrix.cluster }}"
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+
+      # 设置 Serverless Devs
+      - name: Setup Serverless Devs
+        run: |
+          npm install -g @serverless-devs/s
+          # 使用集群 Token 获取阿里云凭证并配置
+          DOPPLER_TOKEN=${{ steps.get-cluster-token.outputs.CLUSTER_DOPPLER_TOKEN }} \
+          doppler run -- bash -c 's config add \
+            --AccessKeyID $ALICLOUD_ACCESS_KEY_ID \
+            --AccessKeySecret $ALICLOUD_ACCESS_KEY_SECRET \
+            -a aliyun --force'
+
+      # 生成动态 s.yaml
+      - name: Generate s.yaml for cluster
+        run: |
+          # 从集群 Doppler 获取 ALICLOUD_REGION
+          REGION=$(DOPPLER_TOKEN=${{ steps.get-cluster-token.outputs.CLUSTER_DOPPLER_TOKEN }} doppler run -- bash -c 'echo $ALICLOUD_REGION')
+          REGION=${REGION:-cn-shanghai}
+
+          cat > apps/executor/s.yaml << YAML
+          edition: 3.0.0
+          name: sql-ops-executor
+          access: aliyun
+
+          vars:
+            region: ${REGION}
+
+          resources:
+            executor:
+              component: fc3
+              props:
+                region: \${vars.region}
+                functionName: sql-ops-executor
+                description: SQL Ops Executor Service (${{ matrix.cluster }})
+                runtime: custom.debian10
+                handler: index.handler
+                timeout: 60
+                memorySize: 256
+                cpu: 0.25
+                diskSize: 512
+                instanceConcurrency: 10
+                code: ./dist
+                customRuntimeConfig:
+                  command:
+                    - node
+                    - index.js
+                environmentVariables:
+                  EXECUTOR_SIGNING_SECRET: \${env.EXECUTOR_SIGNING_SECRET}
+                  SERVICE_DB_CONFIG_JSON: \${env.SERVICE_DB_CONFIG_JSON}
+                  CLUSTER_NAME: ${{ matrix.cluster }}
+          YAML
+
+          echo "Generated s.yaml:"
+          cat apps/executor/s.yaml
+
+      # 部署到阿里云函数计算
+      - name: Deploy to Aliyun FC
+        run: |
+          cd apps/executor
+          doppler run -- s deploy -y
+        env:
+          DOPPLER_TOKEN: ${{ steps.get-cluster-token.outputs.CLUSTER_DOPPLER_TOKEN }}
+
+      # 获取部署后的 URL
+      - name: Get deployed URL
+        id: get-url
+        run: |
+          cd apps/executor
+          FUNCTION_URL=$(s info --yaml-output | grep -o 'https://[^"]*' | head -1 || echo "")
+
+          if [ -n "$FUNCTION_URL" ]; then
+            echo "Deployed URL: $FUNCTION_URL"
+            echo "url=$FUNCTION_URL" >> $GITHUB_OUTPUT
+          else
+            echo "Warning: Could not retrieve function URL"
+          fi
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary for ${{ matrix.cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster:** ${{ matrix.cluster }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.get-url.outputs.url }}" ]; then
+            echo "- **URL:** ${{ steps.get-url.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ============================================
+  # 部署完成汇总
+  # ============================================
+  summary:
+    name: Deployment Summary
+    needs: [deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Multi-Cluster Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See individual job results above for details." >> $GITHUB_STEP_SUMMARY

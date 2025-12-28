@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "idx_db_targets_cluster_type_code_unique" ON "db_targets" USING btree ("cluster_id","db_type","code");

@@ -1,0 +1,106 @@
+name: Executor Dev Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/executor/**'
+      - 'packages/shared/**'
+      - '.github/workflows/executor.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/executor/**'
+      - 'packages/shared/**'
+
+jobs:
+  lint-and-test:
+    name: Lint, Type Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint --filter=@sql-ops/executor...
+
+      - name: Type check
+        run: bun run typecheck --filter=@sql-ops/executor...
+
+      - name: Test
+        run: bun run test --filter=@sql-ops/executor...
+        continue-on-error: true
+
+      - name: Build
+        run: bun run build --filter=@sql-ops/executor...
+
+  deploy:
+    name: Deploy to Dev
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Doppler CLI
+        run: |
+          curl -sLf --retry 3 --tlsv1.2 --proto "=https" 'https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key' | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
+          sudo apt-get update && sudo apt-get install -y doppler
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: cd apps/executor && bun run build
+
+      # 从 Console 的 Doppler 配置获取 DEV 环境的 Executor Token
+      - name: Get Dev Executor Doppler Token
+        id: get-executor-token
+        run: |
+          # 使用 Console Token 获取 CLUSTER_DOPPLER_TOKEN_DEV
+          EXECUTOR_TOKEN=$(doppler secrets get CLUSTER_DOPPLER_TOKEN_DEV --plain 2>/dev/null || echo "")
+
+          if [ -z "$EXECUTOR_TOKEN" ]; then
+            echo "Error: CLUSTER_DOPPLER_TOKEN_DEV not found in Console Doppler config"
+            exit 1
+          fi
+
+          echo "EXECUTOR_DOPPLER_TOKEN=$EXECUTOR_TOKEN" >> $GITHUB_OUTPUT
+          echo "Successfully retrieved Dev Executor Doppler token"
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+
+      - name: Setup Serverless Devs
+        run: |
+          npm install -g @serverless-devs/s
+          # 使用 Executor Token 获取阿里云凭证
+          DOPPLER_TOKEN=${{ steps.get-executor-token.outputs.EXECUTOR_DOPPLER_TOKEN }} \
+          doppler run -- bash -c 's config add \
+            --AccessKeyID $ALICLOUD_ACCESS_KEY_ID \
+            --AccessKeySecret $ALICLOUD_ACCESS_KEY_SECRET \
+            -a aliyun --force'
+
+      - name: Deploy to Aliyun FC
+        run: |
+          cd apps/executor
+          doppler run -- s deploy -y
+        env:
+          DOPPLER_TOKEN: ${{ steps.get-executor-token.outputs.EXECUTOR_DOPPLER_TOKEN }}

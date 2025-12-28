@@ -1,0 +1,56 @@
+# =============================================================================
+# Doppler Configuration - SQL Ops Console
+# =============================================================================
+#
+# 本项目使用 Doppler 统一管理所有环境变量。
+#
+# 快速开始:
+#   1. 安装 Doppler CLI: brew install dopplerhq/cli/doppler
+#   2. 登录: doppler login
+#   3. 在项目根目录运行: doppler setup
+#   4. 启动开发环境: make dev
+#
+# =============================================================================
+
+setup:
+  # 默认配置（适用于本地开发）
+  project: db-bot-console
+  config: dev
+
+# =============================================================================
+# Doppler 项目结构
+# =============================================================================
+#
+# db-bot-console (Console 管理后台)
+# ├── dev          开发环境
+# ├── stg          预发布环境
+# └── prd          生产环境
+#
+# db-bot-executor (Executor 执行服务)
+# ├── dev          开发环境
+# ├── us_1         美国集群 1
+# ├── us_2         美国集群 2
+# ├── sg_1         新加坡集群 1
+# └── sg_2         新加坡集群 2
+#
+# =============================================================================
+# GitHub Secrets 配置
+# =============================================================================
+#
+# 每个环境/集群只需配置一个 Doppler Service Token:
+#
+# Console:
+#   DOPPLER_TOKEN_CONSOLE_PRD    → db-bot-console/prd
+#
+# Executor:
+#   DOPPLER_TOKEN_EXECUTOR_PRD   → db-bot-executor/prd (单集群部署)
+#   DOPPLER_TOKEN_EXECUTOR_US_1  → db-bot-executor/us_1
+#   DOPPLER_TOKEN_EXECUTOR_US_2  → db-bot-executor/us_2
+#   DOPPLER_TOKEN_EXECUTOR_SG_1  → db-bot-executor/sg_1
+#   DOPPLER_TOKEN_EXECUTOR_SG_2  → db-bot-executor/sg_2
+#
+# Vercel:
+#   在 Vercel 项目设置中配置 DOPPLER_TOKEN 环境变量
+#   或使用 Doppler 的 Vercel 集成自动同步
+#
+# =============================================================================
